@@ -1,0 +1,743 @@
+---
+title: "MC2 content based recommender by Weiping Zhang HS22"
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: '4'
+  html_notebook:
+    toc: yes
+    toc_depth: 4
+    df_print: paged
+    toc_float:
+      collapsed: yes
+      smooth_scroll: yes
+    theme: united
+    highlight: tango
+    code_folding: hide
+  html_document:
+    toc: yes
+    toc_depth: '4'
+    df_print: paged
+    toc_float: yes
+---
+
+Library und Data
+
+```{r}
+library(tidyverse)
+library(gridExtra)
+library(dplyr)
+library(data.table)
+library(ggplot2)
+library(reshape2)
+library(rsample)
+library(recommenderlab)
+library(patchwork)
+data(MovieLense)
+```
+
+
+### 1. Erzeugung von Film & Nutzerprofilen
+
+#### 1.1 MovieLense Daten einlesen
+
+```{r}
+mx_movielens <- as(MovieLense, "matrix")  # convert realratingmatrix to normal matrix
+dim(mx_movielens)
+```
+
+- There are 943 users, 1664 films in the dataframe Movielense.
+
+#### 1.2 Binäre User Liked Items Matrix für alle Nutzer erzeugen.
+
+```{r} 
+# convert to binary, ratings > 3 as like, <= 3 as not-like.
+df_user_liked_movies <- as.data.frame(mx_movielens)
+df_user_liked_movies[df_user_liked_movies <= 3] <- 0
+df_user_liked_movies[df_user_liked_movies > 3] <- 1
+df_user_liked_movies
+```
+```{r}
+unlist_df <- as.data.frame(unlist(df_user_liked_movies))
+colnames(unlist_df) <- "liked"
+ggplot(unlist_df,aes(liked)) + 
+  geom_histogram(bins = 2,fill="black", col="grey") +                
+  labs(x="binary ratings", y="count",title="Distribution of user-liked-film") +
+  theme(plot.title = element_text(hjust = 0.5)) 
+```
+```{r}
+sum(!is.na(df_user_liked_movies))
+```
+
+- There are in total 99392 ratings from 943 users on 1664 films. After converting the ratings to binary, about 45000 ratings are 0 (not liked),  55000  are 1 (liked).
+
+
+```{r}
+count_liked1 = as.data.frame(rowSums(df_user_liked_movies,na.rm = TRUE))
+colnames(count_liked1) <- "count"
+g1 = ggplot(count_liked1,aes(count)) + 
+  geom_histogram(binwidth = 10,fill="black", col="grey") +                
+  labs(y="count of users", x="liked frequency",title="Distribution of liked frequency per user") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+count_liked2 = as.data.frame(colSums(df_user_liked_movies,na.rm = TRUE))
+colnames(count_liked2) <- "count"
+g2 = ggplot(count_liked2,aes(count)) + 
+  geom_histogram(binwidth = 10,fill="black", col="grey") +                
+  # die Verteilung
+  labs(y="count of films", x="liked frequency",title="Distribution of liked frequency per film") +
+  theme(plot.title = element_text(hjust = 0.5))
+grid.arrange(g1, g2, nrow = 1,ncol=2)
+```
+
+- left plot: count how many films each user liked. The distribution increased quickly, and reached the highest count (about 180 users, each has 21-30 liked frequency). Afterwards, the distribution decreased slowly. Only very small part of users have liked more than 200 films. 
+
+- rigth plot: count how many times each film is liked. The distribution reached the highest count (720 films) at the first bin (0-10 likes), afterwards with a quick drop to 270 films each are only 11-20 times liked by users, then decreased slowly with a very long tail. Only a very small part of films get more than 200 liked ratings.
+
+#### 1.3 Dimension der User Liked Items Matrix prüfen und ausgeben.
+
+```{r}
+dim(df_user_liked_movies)
+```
+
+- The binary user liked movies matrix has 943 users, 1664 films, same as the original data.
+
+#### 1.4 Movie Genre Matrix für alle Filme erzeugen.
+
+```{r}
+mx_movie_genre <- as.data.frame(MovieLenseMeta)  # read movie genre data
+rownames(mx_movie_genre) <- mx_movie_genre$title
+mx_movie_genre <- as.matrix(mx_movie_genre[,5:22])   # drop some irrelevant columns
+as.data.frame(mx_movie_genre) 
+```
+
+- Each film could have more than one genres.
+
+#### 1.5 Dimension der Movie Genre Matrix prüfen und ausgeben.
+
+```{r}
+dim(mx_movie_genre)      
+```
+
+- the movie genre matrix has 1664 films, 18 genres. It is correct.
+
+#### 1.6 Anzahl unterschiedlicher Filmprofile bestimmen und visualisieren.
+
+```{r}
+df_genre_movie <- as.data.frame(t(mx_movie_genre))
+df_genre_movie$cnt <- rowSums(df_genre_movie == "1")               # new column "cnt": count films of each genre
+df_genre_movie <- cbind(genre = rownames(df_genre_movie), df_genre_movie)# new column "genre": genre name copied from rownames
+ggplot(df_genre_movie,aes(cnt,reorder(genre,cnt))) + geom_col() + labs(x= "number of films", y="genre",title="Distribution of films by genre combination") + 
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+- Distribution of films by genres. Drama is the genre with the largest number (around 710) of films, while fantasy is the least (20). 
+
+#### 1.7 User Genre Profil Matrix mit Nutzerprofilen im Genre Vektorraum erzeugen.
+
+```{r}
+df_user_liked_movies_0 <- df_user_liked_movies 
+# replace na with 0, otherwise the matrix multiplication won't work. 
+# This also makes sense, because the available ratings are between 1 and 5.
+# 0 will represent the no-rating.
+df_user_liked_movies_0[is.na(df_user_liked_movies_0)] <- 0  
+mx_user_genre_bi <- as.matrix(df_user_liked_movies_0) %*% mx_movie_genre
+as.data.frame(mx_user_genre_bi)
+```
+
+```{r}
+ggplot(stack(as.data.frame(mx_user_genre_bi)), aes(x = reorder(ind,-values), y = values)) +
+  geom_boxplot() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),plot.title = element_text(hjust = 0.5)) + labs(x=NULL,y="count of liked",title = "User genre profiles")
+```
+
+- mx_user_genre_bi table: user to genre matrix, each element represents how many times a specific user has liked the genre (rating > 3). 
+- From the boxplot we could see that 
+    - each box has a lot of outliers. Outliers here means that this small group of users liked this genre much more than other normal users. Even the minority genres documentary, fantasy, film-noir have this type of outlier users. 
+    - every box contains some 0 value. This means no genres are liked by all users.
+- Together, the users have very different preferences, popular genre could also be unliked by some users, un-popular genres could also be deeply loved by some users. 
+
+#### 1.8 Dimension der User Genre Profil Matrix prüfen und ausgeben.
+
+- Matrix_1: user_liked_movies is 943(user) x 1664(movie) Dimension
+- Matrix_2: movie_genre is 1664(movie) x 18(genre) Dimension
+- Matrix_1 %*% Matrix_2: should be 943(user) x 18(genre) Dimension.
+
+```{r}
+dim(mx_user_genre_bi)      
+```
+
+- The user-genre binary matrix has 943 users, 18 genres. The result is correct as it should be.
+
+#### 1.9 Anzahl unterschiedlicher Nutzerprofile bestimmen, wenn Stärke der Genre Kombination (a) vollständig bzw. (b) nur binär berücksichtigt wird.
+
+```{r}
+# ordinal data
+mx_user_movie_0 <- mx_movielens 
+mx_user_movie_0[is.na(mx_user_movie_0)] <- 0
+mx_user_genre <- mx_user_movie_0 %*% mx_movie_genre
+
+mx_genre_user <- as.data.frame(t(mx_user_genre))    # a: Stärke Genre Kombination vollständig
+mx_genre_user$summe <- rowSums(mx_genre_user)               # new column "summe": summe user ratings of each genre
+mx_genre_user <- cbind(genre = rownames(mx_genre_user), mx_genre_user)# new column "genre": genre name copied from rownames
+g1 <- ggplot(mx_genre_user,aes(summe,reorder(genre,summe))) + geom_col() + labs(x= "accumulated ratings by users", y="Genre",title="Distribution of ordinal ratings") + 
+  theme(plot.title = element_text(hjust = 0.5))
+mx_genre_user <- mx_genre_user %>% select(-genre)
+
+# binary data
+mx_genre_user_bi <- as.data.frame(t(mx_user_genre_bi))   # User Genre Profil Matrix binary
+mx_genre_user_bi$summe <- rowSums(mx_genre_user_bi)# # new column "summe": summe user ratings of each genre
+mx_genre_user_bi<- cbind(genre = rownames(mx_genre_user_bi), mx_genre_user_bi)
+# new column "genre": genre name copied from rownames
+g2 <- ggplot(mx_genre_user_bi,aes(summe,reorder(genre,summe))) + 
+  geom_col() + 
+  labs(x= "liked frequency by users", y="Genre",title="Distribution of binary ratings") + 
+  theme(plot.title = element_text(hjust = 0.5))
+mx_genre_user_bi <- mx_genre_user_bi %>% select(-genre)
+grid.arrange(g1, g2, nrow = 1)
+```
+
+- left plot: the accumulated ratings of each genre by all users. Right plot: the liked frequency of each genre by all users.
+- Both distributions showed very similar results with different scale: drama is the most liked genre, while documentary is least liked. 
+
+
+### 2 Ähnlichkeit von Nutzern und Filmen
+
+#### 2.1 Cosinus Ähnlichkeit zwischen User Genre und Movie Genre Matrix berechnen.
+
+- generate a funcion cal_cos_similarity_twomx to calculate the cosine similarity of two matrices.
+- formular: 
+  - cosine similarity of two matrix = dot product of two matrix / Euclidean norm of matrix 1 / Euclidean norm of matrix 2
+  
+```{r}
+calc_cos_similarity_twomx <- function(mx_1, mx_2){numerator <- (mx_1 %*% mx_2)
+     denominator <- sqrt(sum(mx_1^2))*sqrt(sum(mx_2^2)) 
+     # or use norm(mx_1,type="f")
+     return(numerator / denominator)} 
+
+cos_sim_user_movie <- as.data.frame(calc_cos_similarity_twomx(mx_user_genre_bi,t(mx_movie_genre)))
+cos_sim_user_movie <- replace(cos_sim_user_movie, cos_sim_user_movie==0, NA) # replace 0 to NA
+cos_sim_user_movie
+```
+
+- cos_sim_user_movie is a 943 x 1664 matrix, with the cosine similarities between users and movies.
+
+#### 2.2 Dimension der Matrix der Cosinus Ähnlichkeiten von Nutzern und Filmen prüfen uns ausgeben.
+
+```{r}
+print(paste("Matrix dimension of the cosine similarity of users and films are ", dim(cos_sim_user_movie)[1],"x",dim(cos_sim_user_movie)[2]))
+```
+
+#### 2.3 5-Zahlen Statistik für Matrix der Cosinus Ähnlichkeiten prüfen uns ausgeben.
+
+```{r}
+stats <- data.frame(t(quantile(cos_sim_user_movie,na.rm = TRUE))) %>% mutate(.,mean = mean(as.matrix(cos_sim_user_movie),na.rm=TRUE), NAs = sum(is.na(cos_sim_user_movie)))
+colnames(stats) <- c("Min", "first Qu", "Median", "third Qu", "Max", "Mean", "NAs")
+stats
+```
+
+#### 2.4 Cosinus Ähnlichkeiten von Nutzern und Filmen mit Dichteplot visualisieren.
+
+```{r}
+df_24 <- cos_sim_user_movie # the cosine similarity as data frame
+rownames(df_24) <- c(1:943) # rename the rownames as: user1, user2,...user943
+df_24_melt <- reshape2::melt(t(df_24))
+colnames(df_24_melt) <- c("film","userID","value")
+g1 = ggplot(aes(x=value), data=df_24_melt) + geom_density() + theme(legend.position = "none") + 
+  labs(x= "cosine similarity", y="density",title="Distribution of user-film cosine similarity") + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+df_24_user <- cos_sim_user_movie # the cosine similarity as data frame
+rownames(df_24_user) <- c(1:943) # rename the rownames as: user1, user2,...user943
+df_24_melt <- reshape2::melt(t(df_24_user))
+colnames(df_24_melt) <- c("film","userID","value")
+df_24_melt$userID <- factor(df_24_melt$userID)
+g2 = ggplot(aes(x=value, colour=userID), data=df_24_melt) + 
+  geom_density() + theme(legend.position = "none") + 
+  labs(x= "cosine similarity", y="density",title="Distribution of similarity per user") + 
+  theme(plot.title = element_text(hjust = 0.5))
+df_24_film_melt <- reshape2::melt(cos_sim_user_movie[,1:500])
+g3 = ggplot(aes(x=value, colour=variable), data=df_24_film_melt) + 
+  geom_density() + theme(legend.position = "none") + 
+  labs(x= "cosine similarity", y="density",title="Distribution of similarity per film") + 
+  theme(plot.title = element_text(hjust = 0.5))
+g1/(g2+g3)
+```
+
+- first row: distribution of all cosine similarities. seconde row left: each line represents the similarity distribution of one user. right: each line represents the similarity distribution of one film.
+- From all three density plot at first row, we could see that the distibutions of user-film similarities all have very long tails. This means there are only very few user-film similarities with values higher than 0.0015.
+
+#### 2.5 Cosinus Ähnlichkeiten für sechs Nutzer
+
+- Cosinus Ähnlichkeiten von Nutzern und Filmen mit Dichteplot für Nutzer “241”, “414”, “477”, “526”, “640” und “710”
+
+```{r}
+df_25 <- df_24_user[c(241,414,477,526,640,710),]
+df_25_melt <- reshape2::melt(t(df_25))
+colnames(df_25_melt) <- c("film","userID","value")
+df_25_melt$userID <- factor(df_25_melt$userID)
+g1 = ggplot(aes(x=value, colour=userID), data=df_25_melt) + 
+  geom_density() +
+  labs(x= "cosine similarity", y="count",title="Distribution of user-film cosine similarity per user") + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+g2 = ggplot(df_25_melt, aes(x = userID, y = value)) +
+  geom_boxplot() + 
+  theme(axis.text.x = element_text(angle = 0, vjust = 0.5, hjust=1),plot.title = element_text(hjust = 0.5)) + 
+  labs(x="user" ,y="cosine similarity",title = "user-film cosine similarity per user")
+
+summary_table_user <- data.frame()
+for(i in 1:943){
+  row_i <- cos_sim_user_movie[i,]
+  stat_i <- data.frame(t(quantile(row_i,na.rm = TRUE))) %>% mutate(.,mean = mean(as.matrix(row_i),na.rm=TRUE), NAs = sum(is.na(row_i)))
+  summary_table_user <- rbind(summary_table_user,stat_i)}
+colnames(summary_table_user) <- c("Min", "first Qu", "Median", "third Qu", "Max", "Mean", "NAs")
+df_s <- summary_table_user[c(241,414,477,526,640,710),]
+df_s$userID <- c(rownames(df_s))
+g3 = ggplot(df_s,aes(userID,NAs)) +
+  geom_col() +
+  theme(axis.text.x = element_text(angle = 0, vjust = 0.5, hjust=1),plot.title = element_text(hjust = 0.5)) + 
+  labs(y="count of NAs" ,x="user ID",title = "number of NAs per user")
+g1/(g2+g3)
+```
+
+- The density plot of user-film similarity with specific 6 users. 
+    - Higher similarity value means this user and this film are more similar, the chance is higher that the user will like this film.
+    - Each user has very different similarity distribution. e.g. user 241, user 414 and user 526 have very long tails, this means most of their similarity values are small. In this case, they have most of similarity values that smaller than 3e-04. 
+    - User 640, user 710 and user 477 have relatively shorter tails compare to the other three users. The user 640 even has visible count of similarity that are larger than 9e-04. 
+
+- The boxplot explains the similarity result from another aspect. User 640 has the highest medium value, followed by user 710 and 477. User 526, 414 and 241 have lower values.  
+
+- The barplot showed the information of how many NAs are in similarity matrix per user. The number of NAs is not necessarily related to the cosine similarity of one user. But when one user has extremely large amount of NAs, this may negatively affect the cosine similarity. 
+
+- Together, user 640 may receive the Top-N recommendations with higher similarities, which means the recommendations may fit this user's preference better. User 241, 414, 526 have lower similarity values, this means they may receive Top-N recommendations which match their preferences not that good as the user 640.
+
+
+
+
+### 3 Empfehlbare Filme
+
+#### 3.1 Bewertete Filme maskieren, 
+
+- d.h. “Negativabzug” der User-Items Matrix erzeugen, um anschliessend Empfehlungen herzuleiten.
+- “Negativabzug” der User-Liked-Items Matrix konstruieren, indem Ratings aller bewerteten Filme auf 0 gesetzt werden, die restlichen auf 1.
+
+```{r}
+# generate matrix Negativabzug: the Ratings -> 0, the NAs -> 1
+neg_abzug <- df_user_liked_movies*0 # all ratings replaced as 0
+neg_abzug[is.na(neg_abzug)] <- 1 # all NAs replaced as 1
+neg_abzug
+```
+
+#### 3.2 Zeilensumme des “Negativabzuges” der User-Items Matrix für die User “5”, “25”, “50” und “150”
+
+```{r}
+rowSums(neg_abzug[c(5,25,50,150),]) 
+```
+
+- This means, user 5 has 1489 not rated films, user 25 has 1586 not rated films, user 50 has 1641, user 150 has 1633 not rated films.
+- They are the candidate films which may be recommended in Top-N lists. 
+
+#### 3.3 5-Zahlen Statistik der Zeilensumme des “Negativabzuges” der User-Items Matrix bestimmen.
+
+```{r}
+summary(rowSums(neg_abzug))
+```
+```{r}
+g1 = ggplot(as.data.frame(rowSums(neg_abzug)),aes(rowSums(neg_abzug))) + geom_histogram() +
+  theme(axis.text.x = element_text(angle = 0, vjust = 0.5, hjust=1),plot.title = element_text(hjust = 0.5)) + 
+  labs(y="count of users" ,x="rowsums per user",title = "Negativabzuges")
+
+g2 = ggplot(as.data.frame(rowSums(neg_abzug[c(5,25,50,150),])),aes(reorder(factor(c(5,25,50,150)),rowSums(neg_abzug[c(5,25,50,150),])),rowSums(neg_abzug[c(5,25,50,150),]))) +
+  geom_col() +
+  theme(axis.text.x = element_text(angle = 0, vjust = 0.5, hjust=1),plot.title = element_text(hjust = 0.5)) + 
+  labs(y="rowsums" ,x="user ID",title = "Negativabzuges")
+g1 + g2
+```
+
+- left plot: distribution of rowsums-per-user in the negativeabzuges dataframe. The rowsums per user indicated the number of unrated films per user. So from this plot, we could understand that, users have number of unrated films between 940 and 1660. The mode is 1640 unrated films (about 270 users).
+- right plot: for the specific five users, display their rowsums. It showed how many unrated films each user has. User 5 has about 1490 unrated films. User 50 has the most unrated films, about 1800. 
+- The unrated films are the potential films which will be recommended to each user. 
+
+### 4 Top-N Empfehlungen
+
+#### 4.1 Matrix für Bewertung aller Filme durch element-weise Multiplikation der Matrix der Cosinus-Ähnlichkeiten von Nutzern und Filmen und “Negativabzug” der User User-Items Matrix erzeugen.
+
+```{r}
+# elementwise multiplication of the cosine-similarity matrix and the "negativabzug" matrix
+mx_ratings_un_movie <- cos_sim_user_movie*neg_abzug
+mx_ratings_un_movie
+```
+
+- Here I get a matrix contains only the cosine similarity of the unrated films.
+
+```{r}
+df_41_user <- mx_ratings_un_movie # the cosine similarity as data frame
+rownames(df_41_user) <- c(1:943) # rename the rownames as: user1, user2,...user943
+df_41_melt <- reshape2::melt(t(df_41_user))
+colnames(df_41_melt) <- c("film","userID","value")
+df_24_melt$label <- "all films"
+df_41_melt$label <- "un-rated films"
+df_24_41 <- rbind(df_24_melt,df_41_melt)
+ggplot(df_24_41,aes(x=value,colour = label)) + geom_density(alpha=0.25) + 
+  labs(x= "cosine similarity", y="density",title="Distribution of user-film cosine similarity") + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+- The similarity distributions between all-films and the unrated-films are very similar. This indicates the un-rated films and rated-films have similar film-profiles. Users could get the recommendations which are similar to what they have liked.  
+
+#### 4.2 Dimension der Matrix für die Bewertung aller Filme prüfen.
+
+```{r}
+dim(mx_ratings_un_movie)
+```
+
+- The dimension 943 users x 1664 movies is same as the cosine similarity user-movie matrix and the negative abzug matrix. The new matrix has the correct dimension.
+
+#### 4.3 Top-20 Listen pro Nutzer extrahieren und Länge der Top-20 Listen pro Nutzer prüfen
+
+- The idea behind is, each user should get recommendations which have the highest similarity with this user.
+- The system should recommend only films which have not been rated (watched) by this user.
+
+
+- In the last step, I have generated a matrix which contains the cosine user-film-similarity of the unrated films per user.
+- Now I will extract 20 films which have the highest similarity per user.
+- get_topn_rocos() function will extract top-N list for each user.
+
+```{r}
+# generate function get_topn_rocos to extract top N list (movies with highest similarity values) for each user
+get_topn_rocos <- function(matrix,n){
+    dim1 = dim(matrix)[1]
+    dim2 = dim(matrix)[2]
+    matrix_melt <- reshape2::melt(t(matrix)) %>% 
+      rename(UserID = Var2, movie = Var1, cos_sim = value) 
+    # matrix_melt is a long dataframe, with 3 columns: userID,movie,cos_sim
+    Top <- matrix_melt  %>% 
+      arrange(UserID,desc(cos_sim)) %>%  # sort by userID and cosine similarity 
+      mutate(rank = rep(1:dim2,dim1)) %>%  # generate new column "rank", For each user, the rank will start from 1.
+      filter(rank <= n) %>%    # keep only the first n ranks for each user
+      reshape2::dcast(UserID ~ rank, value.var = "movie") # reshape the dataframe,userID as row, rank as column, movie as values
+    rownames(Top) <- Top$UserID # set rownames same as UserID column
+    Top <- Top %>% select(-UserID) # drop the column UserID
+    colnames(Top) <- c(paste0("Top_", 1:n)) # change the column name as Top_1, Top_2, .... 
+    return(Top)}
+```
+
+
+```{r}
+# Top-20 list for each user
+top_20_list <- get_topn_rocos(mx_ratings_un_movie,20)
+top_20_list
+```
+
+- Above I get the top-20 movies for each user. Each row represents one user. Twenty columns represent the top-20 recommended films which have the highest similarity to this user. 
+
+
+
+- prove the length of top-N list for each user by five number of statistics
+    - count the not-NA per row
+    - summary the count results of all rows
+
+```{r}
+summary(rowSums(!is.na(top_20_list)))[-4]
+```
+
+- We could see from the result that min and max both are 20, this means all rows have 20 not NA, the length of Top-20 lists for each user are all exactly 20.
+- So all users get 20 not-NA recommendations.
+
+#### 4.4 Verteilung der minimalen Ähnlichkeit
+
+- Verteilung der minimalen Ähnlichkeit für Top-N Listen für N = 10, 20, 50 und 100 für alle Nutzer visuell vergleichen.
+
+- In last task I generated the Top-N film lists for each user.
+- Now I will check the corresponding smallest similarity in each list. This means the similarity of the N-th rank film.
+- analyze_topn_recos() function will extract the minimum similarities in each Top-N lists, and return them in a histogram.
+
+```{r}
+analyze_topn_recos <- function(matrix,n){ # matrix: input matrix, n: top-N
+    dim1 = dim(matrix)[1]
+    dim2 = dim(matrix)[2]
+    matrix_melt <- reshape2::melt(t(matrix)) %>% 
+      rename(UserID = Var2, movie = Var1, cos_sim = value) 
+    # matrix_melt is a long dataframe, with 3 columns: userID,movie,cos_sim
+    Top <- matrix_melt  %>% 
+      arrange(UserID,desc(cos_sim)) %>%  # sort by userID and cosine similarity 
+      mutate(rank = rep(1:dim2,dim1)) %>%  # generate new column "rank", For each user, the rank will start from 1.
+      filter(rank == n)     # keep only the n-th rank for each user
+    # plot all the n-th rank similarities, which are the smallest similarity in each top-N list
+    ggplot(Top,aes(cos_sim)) + 
+      geom_histogram(bins = 50) + 
+      labs(x= "minimum cosine similarity", y="count",title=paste("min. similarities in Top -",n, "lists ")) + 
+      theme(plot.title = element_text(hjust = 0.5))
+    }
+```
+
+- Here I will analyse the minimum similarity distributions in Top-10, Top-20, Top-50, and Top-100 lists
+
+```{r}
+g1 = analyze_topn_recos(mx_ratings_un_movie,10)
+g2 = analyze_topn_recos(mx_ratings_un_movie,20)
+g3 = analyze_topn_recos(mx_ratings_un_movie,50)
+g4 = analyze_topn_recos(mx_ratings_un_movie,100)
+grid.arrange(g1,g2,g3,g4,nrow=2,ncol=2)
+```
+
+- The minimium cosine similarity of different Top-N lists showed very similar right skewed distibution, with the mode at around min. similarity = 0.0002. 
+- One difference is, with larger N value, the largest min. similarity is smaller, for example, in top-10 lists minimum similarity is between 0 and 0.0037, but in top-100 lists minimum similarity is between 0 and 0.0028.
+- This difference makes sense, because when increase the length of Top-N list, the system will have to include more films in the Top-N list which have smaller similarity values, the minimum similarity value will be smaller.
+
+
+#### 4.5 Top-20 Empfehlungen für Nutzer “5”, “25”, “50” und “150” visuell evaluieren.
+
+- Funktion create_cleveland_plot() zum visuellen Vergleich von Top N Empfehlungen und Nutzerprofil pro User implementieren, indem Empfehlungen und Nutzerprofil im 19 dimensionalen Genre Raum verglichen werden. Die Funktion create_cleveland_plot() verwendet idealerweise die Funktion get_topn_recos()
+
+- Implement create_cleveland_plot() function to visually compare top N recommendations and user profile per user by comparing recommendations and user profile in 19 dimensional genre space. The create_cleveland_plot() function ideally uses the get_topn_recos() function
+
+
+
+- visualize Top-N recommendations and user-profiles
+    - create function create_cleverland_plot() to plot the genre proportion in the Top-N recommendations vs the genre proportion in true user profiles. It will also return the result as table form for further evaluation.
+    - The function could work on multiple users, with multiple Top-N.
+    - get_topn_rocos() will be applied in this function.
+
+```{r}
+create_cleverland_plot <- function(mx,userID_list,N_lst){
+  # input:
+    # mx: the matrix with only the similarities of unrated films
+    # userID_list: selected userID 
+    # N_lst: selected N values for Top-N
+  # return:
+    # plot_: cleverland plots
+    # table_: the corresponding results in a table, which could be used for further analysis
+  rbind_long <- data.frame()
+  for(m in 1:length(N_lst)){
+    n <- N_lst[m]
+    
+    for(j in 1:length(userID_list)){
+      i <- userID_list[j]
+      
+      top_n <- as.data.frame(t(get_topn_rocos(mx[i,],n))) 
+      colnames(top_n) <- "movie_name"
+      df_movie_genre <- as.data.frame(mx_movie_genre) 
+      nr_genre <- dim(mx_movie_genre)[2]
+      df_movie_genre$movie_name <- rownames(df_movie_genre)
+      top_n_movie_genre <- left_join(top_n,df_movie_genre,by=c("movie_name"="movie_name"))%>%select(-movie_name)
+      top_n_movie_genre <- colSums(top_n_movie_genre,na.rm=TRUE,dims=1)/sum(colSums(top_n_movie_genre,na.rm=TRUE,dims=1)) # genres proportion in top-n recommendation lists
+      
+      tb <- rbind(top_n_movie_genre,mx_user_genre[i,]/sum(mx_user_genre[i,])) # bind the recommendation list and the user profile
+      rownames(tb) <- c("Top_n","user_profile") 
+      tb <- as.data.frame(t(tb)) %>% arrange(desc(Top_n))
+      tb$genre <- rownames(tb) 
+      tb_long <- pivot_longer(tb,cols=c(Top_n,user_profile),names_to="type",values_to="proportion") %>% arrange(desc(proportion))
+      tb_long$userID <- paste("user",i)
+      tb_long$N <- paste("Top -",n)
+      rbind_long <- rbind(rbind_long,tb_long)
+    }}
+  # depends on the parameters' length, display either N or userID as x-axis
+  if(length(N_lst)>length(userID_list)){ 
+    plot = ggplot(rbind_long, aes(proportion,fct_inorder(genre))) +
+      geom_line(aes(group = genre)) +
+      geom_point(aes(color = type)) + coord_flip() +
+      facet_grid(cols = vars(userID),rows=vars(N)) +
+      labs(x="proportion", y="genre",title= paste("Top-N", " recommendations VS user profile") )+
+      theme(plot.title = element_text(hjust = 0.5),axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+    
+  }
+  else{
+    plot = ggplot(rbind_long, aes(proportion,fct_inorder(genre))) +
+      geom_line(aes(group = genre)) +
+      geom_point(aes(color = type)) + coord_flip() +
+      facet_grid(rows = vars(userID),cols=vars(N)) +
+      labs(x="proportion", y="genre",title= paste("Top -", n, " recommendations VS user profile") )+
+      theme(plot.title = element_text(hjust = 0.5),axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+  }
+  
+  result <- list("plot_" = plot, "table_" = rbind_long)}
+```
+
+- visualize The Top-20 recommendations and user profiles of user with ID 5, 25, 50, 150
+
+```{r}
+result1 = create_cleverland_plot(mx_ratings_un_movie,c(5,25,50,150),20)
+result1$plot_
+```
+
+- In the cleverland plots, the blue points represent the genre proportion in user's profile, where the red points represent the genre proportion in the predicted Top-20 lists.
+- In these four users, user 50 and user 150 have similar preferences on genres. Both prefer Drama Romance and Comedy much more than other genres. User 5 and user 25 prefer Comedy Action Adventure Sci-Fi, but with smaller differences to other genres.
+- For each user, the Top-20 recommendations have very similar trends as the user profile.  
+
+
+- Next I will evaluate the Top-20 recommendations vs true user-profiles quantitatively by MAE (mean absolute error) and qualitatively by AP (average precision).
+- AP@k (average precision) is a rank metric, it evaluates the result through searching the relevant items in rank-k predictions. 
+
+```{r}
+result1$table_
+```
+
+- generate function avg_precision() which will calculate average precision of one user. 
+
+- generate function AP_MAE() which will calculate metrics AP and MAE of multiple users with different Top-N settings. It will use the avg_precision() function.
+
+```{r}
+# calculate average precision (AP) of one user. The function will be applied in AP_MAE() function
+# input: 
+    # df: dataframe include columns of rank_true, rank_pred, genres
+    # N1: max number of possible relavant items
+    # N2: scan the top-N2 recommendations
+# return: AP@N1
+avg_precision <- function(df,N1,N2){
+  count_relv = 0
+  sum_relv = 0
+  for(i in 1:N2){
+    row_i <- df[i,]
+    if (row_i["rank_true"] <= N1){# this means it is a relavant genre
+      count_relv = count_relv + 1
+      sum_relv = sum_relv + count_relv/i
+    }}
+  return(sum_relv/count_relv)}
+
+
+# AP_MAE will calculate the qualitative metric average-precision (a ranking metric) and quantitative metric MAE (mean absolute error)
+# input data: 
+    # result: the table calculated from create_cleverland_plot() function
+    # N1: max number of possible relavant items
+    # N2: scan the top-N2 recommendations
+# output: metrics_table
+AP_MAE <- function(result,N1,N2){
+  metrics_table <- data.frame(matrix(ncol = 4, nrow = 0)) # an empty table to store the metrics result
+  colnames(metrics_table) <- c("userID", "N", "AP","MAE") # set column names 
+  
+  id_uni <- unique(result$userID) # extract unique userID
+  n_uni <- unique(result$N)  # extract unique N in top-N
+  for(i in 1:length(id_uni)){
+    for(j in 1:length(n_uni)){ # each time calculate only for one user with one Top-N
+      id <- id_uni[i]  # userID
+      n <- n_uni[j] # Top-N
+      df <- result %>% filter(., userID == id) %>% filter(., N == n) # extract the corresponding data 
+      # split the data into two parts: true (user profile) and predicted (Top-N recommendation result)
+      # create now features in each part: ranks of genres (by count), and genre proportion which is calculated from count
+      top_true <- df %>% filter(.,type == "user_profile") %>% arrange(.,desc(proportion)) %>% mutate(.,rank_true = 1:18) %>% rename(.,prop_true = proportion) %>%select(c(genre,prop_true,rank_true))
+
+      top_pred <- df %>% filter(.,type == "Top_n") %>% arrange(.,desc(proportion))%>% mutate(.,rank_pred = 1:18) %>% rename(.,prop_pred = proportion)
+      # join two parts
+      new_top <- left_join(top_pred,top_true,by="genre") %>% mutate(.,prop_diff = (prop_true - prop_pred))
+      
+      # calculate average precision (by function avg_precision()) and MAE. 
+      AP_ <- avg_precision(new_top,N1,N2)
+      MAE_ <- mean(abs(new_top$prop_diff))
+      # add result into the metrics_table
+      metrics_table[nrow(metrics_table) + 1,] = list(id,n,AP_,MAE_)
+}}
+return(metrics_table)  
+}
+```
+
+- evaluate Top-20 recommendations and user profiles of user 5, 25, 50, 150 
+
+```{r}
+metrics_1 <- AP_MAE(result1$table_,6,6)
+metrics_1
+```
+
+```{r}
+g1 = ggplot(metrics_1,aes(reorder(userID, MAE),MAE,fill = N)) + geom_col(position = "dodge",color="gray",fill="gray") +
+  labs(title="quantitative evaluation",y="mean absolute error (MAE)") + 
+  theme(plot.title = element_text(hjust = 0.5))
+g2 = ggplot(metrics_1,aes(reorder(userID, MAE),AP,fill = N)) + geom_col(position = "dodge",color="gray",fill="gray") +
+  labs(title="qualitative evaluation",y="average precision (AP@6)") + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+g1 + g2
+```
+
+- MAE of four users are very similar, between 0.024 and 0.027.
+- Four users all have high AP@6 values. User 25,  user 50, and user 150 have the AP@6 of 1. This means the favourite 6 genres in user profile have also exactly the top-6 highest proportion in the recommendations. User 5 has AP@6 of 0.97.
+- This means the system could recommend 20 films to the four users with very high average-precision of genres. 
+
+
+#### 4.6 Für Nutzer “133” und “555” Profil mit Top-N Empfehlungen für N = 20, 30, 40, 50 analysieren, visualisieren und diskutieren.
+
+- visualize the Top-N (20,30,40,50) recommendations vs user (133, 555) profiles
+
+```{r}
+result2 <- create_cleverland_plot(mx_ratings_un_movie,c(133,555),c(20,30,40,50))
+result2$plot_
+```
+
+- parameter userID: User 133 and user 555 have very different preferences on film genres.
+- parameter N: using different Top-N for each user doesn't make much differences in the genres proportions. All Top-N recommendations have very similar trends as the corresponding user profile.
+
+
+- Next: evaluate the results quantitatively (by MAE) and qualitatively (by AP)
+
+```{r}
+metrics_2 <- AP_MAE(result2$table_,6,6)
+metrics_2
+```
+
+```{r}
+g1 = ggplot(metrics_2,aes(reorder(userID,MAE),MAE,fill = N)) + geom_col(position = "dodge") +
+  labs(x=NULL,title="quantitative evaluation",y="mean absolute error (MAE)") + 
+  theme(plot.title = element_text(hjust = 0.5))
+g2 = ggplot(metrics_2,aes(reorder(userID,MAE),AP,fill = N)) + geom_col(position = "dodge") +
+  labs(x=NULL,title="qualitative evaluation",y="average precision (AP@6)") + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+g1 + g2
+```
+
+- MAE: when increase N, MAE values first decreased and started to increase again with N = 50. MAE is smallest with N = 40.
+- AP@6: user 133 has AP of 1 in all four Top-N lists. AP@6 of user 555 increased from 0.88 to 1 when N increased.
+- All AP@6 are high, which indicates good performance of the recommender system on these two users with four different Top-N lists.
+
+
+#### 4.7 analyse Top-N and user profiles of all users 
+
+- Now analyse the recommender system for all users
+- In the last task, MAE is smallest with Top-40. So I will analyse Top-40 and user profiles.
+
+```{r}
+userID_list <- rownames(mx_ratings_un_movie)
+result_all <- create_cleverland_plot(mx_ratings_un_movie,userID_list,c(40))
+ggplot(result_all$table_, aes(x = reorder(genre,-proportion), y = proportion,color=type)) +
+  geom_boxplot() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),plot.title = element_text(hjust = 0.5)) + labs(y="Proportion",x = "Genres",title = "Genre proportion of Top-40 recommendations and user profiles") 
+```
+
+- The genre proportions of Top-40 recommendations showed very similar trends as the user profiles.
+- Drama, Action, Comedy, Thriller, Romance have largest proportions in both Top-40 recommendations and user profiles, where Documentary, Fantasy, Western, Film-Noir, Animation have the smallest proportions. 
+- Most of the boxes have outiers. They represent the users who have strong preference on this genre, or the users who get strong recommendations on this genre.
+
+
+- evaluation
+
+```{r}
+metrics_all <- AP_MAE(result_all$table_,6,6)
+g1 = ggplot(metrics_all,aes(AP)) + geom_histogram(bins=10) + theme(plot.title = element_text(hjust = 0.5)) + labs(title = "AP@6 distribution of all users")
+g2 = ggplot(metrics_all,aes(MAE)) + geom_histogram(bins=10)+ theme(plot.title = element_text(hjust = 0.5)) + labs(title = "MAE distribution of all users")
+g1+g2
+```
+
+- all AP@6 values are between 0.80 and 1. The mode of AP@6 is 1. 
+- MAE values are between 0.01 and 0.045. The mode of MAE is about 0.022.
+
+
+- calculate the mean of all users' AP@6 --> MAP@6
+  and the mean of all users' MAE --> avg_MAE
+  
+```{r}
+MAP <- mean(metrics_all$AP)
+avg_MAE <- mean(metrics_all$MAE)
+print(paste("MAP@6 is",MAP,".  mean MAE is",avg_MAE))
+
+```
+
+
+### 5 Summary
+
+- The content-based recommender system used cosine similarity between user and films to select Top-N films for each user. 
+- The recommendations for a given user are only dependent on this user's profile. 
+- I evaluated the system by comparing the genre proportions between Top-N recommendations and user-profile.
+- The two metrics I used are MAE for quantitatively evaluation and AP (and MAP) for qualitatively evaluation. 
+- The recommender system has average MAE of 0.022 and MAP@6 (mean average-precision) of 0.98 between Top-40 recommendations and user-profile through analysing all the 943 users.
+- This indicates the recommender system can give user Top-40 film recommendations with very high precision based on genre proportions.
+
